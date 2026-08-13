@@ -829,8 +829,12 @@ def main():
                         help='memory for each comparison job [32Gi]')
     parser.add_argument('--compareDisk', type=human2bytesN, default='20Gi',
                         help='disk for each comparison job, on top of 5x the reference size [20Gi]')
-    parser.add_argument('--splitMemory', type=human2bytesN, default='8Gi',
-                        help='memory for the job that splits the query VCF [8Gi]')
+    parser.add_argument('--splitMemory', type=human2bytesN, default='24Gi',
+                        help='memory for each query-split job. bcftools +split grows superlinearly '
+                        'with the records it handles: splitting a 232-sample pangenome VCF 231 ways '
+                        'peaked at 0.7Gi for chr21 but 9.8Gi for chr1 (0.9 vs 2.9 Gi per million '
+                        'records), so a whole-genome split needs far more than the biggest single '
+                        'chromosome suggests. pair with --doubleMem [24Gi]')
     parser.add_argument('--splitDisk', type=human2bytesN, default=None,
                         help='disk for each query-split job. the default scales with the number of '
                         'truth samples, because splitting one multi-sample VCF into N single-sample '
