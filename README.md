@@ -241,8 +241,7 @@ as a tarball -- off by default, since the fp/fn/tp VCFs for a few hundred sample
 
 Both of these compare the same two HPRC minigraph-cactus releases against each other. Nothing is
 staged first — every input is a URL, and the reference is fetched, unpacked and indexed on a
-worker. Add `--workDir` pointing at somewhere your compute nodes can write and singularity can
-bind (node-local scratch is usually right); it is omitted here because it is site-specific.
+worker.
 
 ### Against GIAB, on CHM13
 
