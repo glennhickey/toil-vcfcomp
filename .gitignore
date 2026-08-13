@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# generated at build time by setup.py
+src/toil_vcfcomp/version.py
