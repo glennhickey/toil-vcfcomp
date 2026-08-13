@@ -116,7 +116,7 @@ def vcfcomp_workflow(job, options, manifest_rows, query_ids, ref_id, ref_fai_id)
     for callset, path, vcf_id, tbi_id in query_ids:
         split_job = root_job.addChildJobFn(split_query, options, callset, path, vcf_id, tbi_id,
                                            truth_samples,
-                                           disk=int(vcf_id.size * 4) + 2 * 2 ** 30,
+                                           disk=split_disk(options, vcf_id, len(truth_samples)),
                                            memory=clamp_memory(options.splitMemory))
         split_rvs[callset] = split_job.rv()
 
@@ -133,6 +133,22 @@ def vcfcomp_workflow(job, options, manifest_rows, query_ids, ref_id, ref_fai_id)
     fan_job = root_job.addFollowOnJobFn(compare_all_samples, options, manifest_rows, split_rvs,
                                         ref_job.rv('fasta'), ref_job.rv('fai'), ref_job.rv('sdf'))
     return fan_job.rv()
+
+
+def split_disk(options, vcf_id, n_truth_samples):
+    """ disk for one split job.
+
+    Splitting a multi-sample VCF into single-sample ones is not size-preserving: every output
+    repeats the site columns, so the total grows with the number of samples split out rather than
+    staying near the input size.  Measured on a real 232-sample pangenome VCF the outputs came to
+    11.4x the input for 231 samples -- about 0.05x the input per sample -- against the flat 4x
+    this used to request, which was taken from a toy file and was wrong by 2.5x at real scale.
+    """
+    if options.splitDisk:
+        return options.splitDisk
+    per_sample = 0.05 * max(1, n_truth_samples)
+    # 1x for the local copy of the input, the rest for the outputs
+    return int(vcf_id.size * (1.2 + per_sample)) + 4 * 2 ** 30
 
 
 def reference_disk(options, ref_id, need_sdf):
@@ -815,6 +831,11 @@ def main():
                         help='disk for each comparison job, on top of 5x the reference size [20Gi]')
     parser.add_argument('--splitMemory', type=human2bytesN, default='8Gi',
                         help='memory for the job that splits the query VCF [8Gi]')
+    parser.add_argument('--splitDisk', type=human2bytesN, default=None,
+                        help='disk for each query-split job. the default scales with the number of '
+                        'truth samples, because splitting one multi-sample VCF into N single-sample '
+                        'ones repeats the site columns N times -- measured at 11x the input for 231 '
+                        'samples, not a fraction of it')
     add_binaries_options(parser)
 
     options = parser.parse_args()
