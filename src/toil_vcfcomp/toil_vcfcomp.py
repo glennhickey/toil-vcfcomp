@@ -659,6 +659,21 @@ def vcf_header_contigs(vcf_path):
     return contigs
 
 
+# the same assembly under the names UCSC and the benchmark producers each use.  only used to
+# decide whether to warn; the contig-length check runs regardless and is what actually catches a
+# wrong reference
+assembly_aliases = [set(['hs1', 'chm13v2', 'chm13v2.0']),
+                    set(['hg38', 'grch38', 'grch38_no_alt'])]
+
+
+def same_assembly(manifest_ref, ref_name):
+    a = manifest_ref.strip().lower()
+    b = os.path.splitext(ref_name)[0].strip().lower()
+    if a in b or b in a:
+        return True
+    return any(a in group and b in group for group in assembly_aliases)
+
+
 def collect_query_contigs(options, manifest_rows):
     """ read the contig lists the reference will be checked against.
 
@@ -668,7 +683,7 @@ def collect_query_contigs(options, manifest_rows):
     """
     manifest_refs = set(row['ref'] for row in manifest_rows if row.get('ref'))
     for manifest_ref in sorted(manifest_refs):
-        if manifest_ref and manifest_ref.lower() not in options.refName.lower():
+        if manifest_ref and not same_assembly(manifest_ref, options.refName):
             logger.warning('The truth index says its calls are against "{}", but --ref is "{}". '
                            'Check that these are the same assembly.'.format(manifest_ref, options.refName))
 

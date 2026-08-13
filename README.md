@@ -237,6 +237,74 @@ Each tool reports its headline numbers in its own format (aardvark `summary.tsv`
 aardvark's column set. `--exportAll` additionally exports each comparison's full output directory
 as a tarball -- off by default, since the fp/fn/tp VCFs for a few hundred samples add up.
 
+## Worked examples
+
+Both of these compare the same two HPRC minigraph-cactus releases against each other. Nothing is
+staged first — every input is a URL, and the reference is fetched, unpacked and indexed on a
+worker. Add `--workDir` pointing at somewhere your compute nodes can write and singularity can
+bind (node-local scratch is usually right); it is omitted here because it is site-specific.
+
+### Against GIAB, on CHM13
+
+GIAB publishes a CHM13v2.0 benchmark for **HG002 only** — the Q100 draft, as separate small-variant
+and structural truth sets. So this is 2 call sets × 2 truth sets × 1 sample.
+
+```
+giab-truthset --ref CHM13v2.0 --benchmarks all -o giab.chm13.csv
+
+toil-vcfcomp ./jobstore \
+    --queryVcf https://s3-us-west-2.amazonaws.com/human-pangenomics/pangenomes/freeze/release2/minigraph-cactus/v2.0/hprc-v2.0-mc-chm13/hprc-v2.0-mc-chm13.wave.vcf.gz \
+               https://s3-us-west-2.amazonaws.com/human-pangenomics/pangenomes/freeze/release2/minigraph-cactus/v2.1/hprc-v2.1-mc-chm13/hprc-v2.1-mc-chm13.wave.vcf.gz \
+    --truthIndex giab.chm13.csv \
+    --ref https://hgdownload.soe.ucsc.edu/goldenPath/hs1/bigZips/hs1.fa.gz \
+    --outDir ./giab-chm13-report \
+    --evalType aardvark \
+    --batchSystem slurm \
+    --slurmTime 100:00:00 \
+    --doubleMem true \
+    --binariesMode singularity \
+    --threads 8 --compareMemory 32Gi \
+    --logFile toil-vcfcomp.log \
+    --logInfo
+```
+
+Expect a loud warning that 231 samples are query-only. That is correct here — only HG002 is
+shared — but it is the same warning a real sample-name mismatch produces, so do not learn to
+ignore it.
+
+### Against the HPRC dipcall calls, on CHM13
+
+The Yale R2 submission has dipcall calls on CHM13v2 as well as GRCh38, which gets you **231
+samples** instead of one. Same graphs, same reference, only the manifest changes:
+
+```
+hprc-truthset --ref CHM13v2 --caller dipcall -o hprc.chm13.csv
+
+toil-vcfcomp ./jobstore-hprc \
+    --queryVcf https://s3-us-west-2.amazonaws.com/human-pangenomics/pangenomes/freeze/release2/minigraph-cactus/v2.0/hprc-v2.0-mc-chm13/hprc-v2.0-mc-chm13.wave.vcf.gz \
+               https://s3-us-west-2.amazonaws.com/human-pangenomics/pangenomes/freeze/release2/minigraph-cactus/v2.1/hprc-v2.1-mc-chm13/hprc-v2.1-mc-chm13.wave.vcf.gz \
+    --truthIndex hprc.chm13.csv \
+    --ref https://hgdownload.soe.ucsc.edu/goldenPath/hs1/bigZips/hs1.fa.gz \
+    --outDir ./hprc-chm13-report \
+    --evalType aardvark \
+    --batchSystem slurm \
+    --slurmTime 100:00:00 \
+    --doubleMem true \
+    --binariesMode singularity \
+    --threads 8 --compareMemory 32Gi \
+    --maxJobs 200 \
+    --logFile toil-vcfcomp-hprc.log \
+    --logInfo
+```
+
+That is **462 whole-genome comparisons** (2 call sets × 231 samples), so unlike the GIAB run it is
+a real cluster job. `--maxJobs` keeps it from taking the whole queue. Each sample's truth is
+downloaded once and shared by both call sets, so it is 231 downloads rather than 462.
+
+A note on the graphs' own samples: each carries 232, of which 231 have dipcall truth. The
+remaining one is `GRCh38`, a reference path in the graph rather than a sample, and it is correctly
+reported as query-only.
+
 ## Things that will bite you
 
 **`GT="alt"` is not the filter you want.** bcftools classifies a half-called genotype like `.|1`
