@@ -635,7 +635,8 @@ def make_report(job, options, results):
         raise RuntimeError('No results to report: every comparison failed or produced an '
                            'unparseable summary. Check the job logs for the individual samples.')
 
-    paths = report.write_report(rows, chrom_rows, work_dir)
+    paths = report.write_report(rows, chrom_rows, work_dir,
+                                callset_order=getattr(options, 'callsets', None))
     RealtimeLogger.info('Report covers {} rows from {} callset/truthset/sample/tool comparisons'.format(
         len(rows), len(set((r['callset'], r['truthset'], r['sample'], r['tool']) for r in rows))))
     file_ids = dict((name, job.fileStore.writeGlobalFile(path)) for name, path in paths.items())
@@ -859,8 +860,9 @@ def main():
             # checked against these in prepare_reference, once the .fai exists
             options.queryContigs = collect_query_contigs(options, manifest_rows)
 
+            options.callsets = callset_labels(options.queryVcf)
             query_ids = []
-            for callset, query_vcf in zip(callset_labels(options.queryVcf), options.queryVcf):
+            for callset, query_vcf in zip(options.callsets, options.queryVcf):
                 query_vcf_id = toil.importFile(makeURL(query_vcf))
                 query_tbi_id = None
                 if os.path.isfile(query_vcf + '.tbi'):
@@ -888,7 +890,8 @@ def main():
 
         failures = report_id_dict.pop('_failures', [])
         for name in sorted(report_id_dict):
-            suffix = {'report': '.tsv', 'summary': '.summary.tsv', 'chrom': '.chrom.tsv'}[name]
+            suffix = {'report': '.tsv', 'summary': '.summary.tsv', 'chrom': '.chrom.tsv',
+                      'text': '.txt', 'compare': '.compare.tsv'}[name]
             out_path = makeURL(os.path.join(options.outDir, 'report' + suffix))
             logger.info('Exporting {}'.format(out_path))
             toil.exportFile(report_id_dict[name], out_path)

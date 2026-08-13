@@ -258,8 +258,168 @@ def summarize(rows):
     return header, out_rows
 
 
-def write_report(rows, chrom_rows, out_dir, prefix='report'):
-    """ write the three tables and return their paths """
+# each tool reports one comparison that means "did we get the call right".  they do not agree on
+# what to call it, and mixing them in one table would compare unlike things
+primary_comparison = {'aardvark': 'GT', 'vcfeval': 'GT', 'happy': 'GT', 'truvari': 'ALLELE'}
+
+
+def headline_rows(summary_rows, comparison=None):
+    """ the subset of the summary worth putting in front of someone: the primary comparison for
+    each tool, unstratified by region or filter """
+    keep = []
+    for row in summary_rows:
+        if row['region_label'] not in ('ALL', ''):
+            continue
+        if row['filter'] not in ('ALL', ''):
+            continue
+        wanted = comparison or primary_comparison.get(row['tool'], 'GT')
+        if row['comparison'] != wanted:
+            continue
+        keep.append(row)
+    return keep
+
+
+def _variant_type_order(names):
+    """ ALL first, then alphabetical -- the overall number is the one people want first """
+    return ['ALL'] + sorted(n for n in names if n != 'ALL')
+
+
+def build_comparison(summary_rows, callset_order, metric='f1', comparison=None):
+    """ head-to-head: one row per (tool, truthset, variant type), one column per callset, plus the
+    delta against the first callset and which callset won """
+    rows = headline_rows(summary_rows, comparison)
+    column = '{}_mean'.format(metric)
+
+    cells = {}
+    callsets = []
+    for row in rows:
+        if row['callset'] not in callsets:
+            callsets.append(row['callset'])
+        cells[(row['tool'], row['truthset'], row['variant_type'], row['callset'])] = _num(row[column])
+
+    # the order the callsets were given on the command line, so the baseline is the first --queryVcf
+    if callset_order:
+        callsets = [c for c in callset_order if c in callsets] + \
+                   [c for c in callsets if c not in callset_order]
+    else:
+        callsets = sorted(callsets)
+
+    keys = sorted(set((t, ts) for (t, ts, _v, _c) in cells))
+    out = []
+    for tool, truthset in keys:
+        variant_types = set(v for (t, ts, v, _c) in cells if t == tool and ts == truthset)
+        for variant_type in _variant_type_order(variant_types):
+            values = [cells.get((tool, truthset, variant_type, c)) for c in callsets]
+            present = [(c, v) for c, v in zip(callsets, values) if v is not None]
+            if not present:
+                continue
+            row = {'tool': tool, 'truthset': truthset, 'variant_type': variant_type,
+                   'metric': metric}
+            for callset, value in zip(callsets, values):
+                row[callset] = '' if value is None else '{:.6f}'.format(value)
+            baseline = values[0]
+            row['delta'] = ''
+            if baseline is not None and len(present) > 1 and values[-1] is not None:
+                row['delta'] = '{:+.6f}'.format(values[-1] - baseline)
+            row['best'] = max(present, key=lambda cv: cv[1])[0] if len(present) > 1 else ''
+            out.append(row)
+
+    header = ['tool', 'truthset', 'variant_type', 'metric'] + callsets + ['delta', 'best']
+    return header, out, callsets
+
+
+def _fmt_table(header, rows, aligns=None):
+    """ a whitespace-aligned block, since this file is meant to be read rather than parsed """
+    widths = [len(h) for h in header]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+    aligns = aligns or ['<'] * len(header)
+    out = ['  '.join('{:{}{}}'.format(h, aligns[i], widths[i]) for i, h in enumerate(header))]
+    for row in rows:
+        out.append('  '.join('{:{}{}}'.format(str(c), aligns[i], widths[i])
+                             for i, c in enumerate(row)))
+    return out
+
+
+def write_summary_text(rows, summary_rows, path, callset_order=None, comparison=None):
+    """ the file to open first: what ran, the headline numbers, and which callset won """
+    lines = []
+    heads = headline_rows(summary_rows, comparison)
+    callsets = callset_order or sorted(set(r['callset'] for r in rows))
+    truthsets = sorted(set(r['truthset'] for r in rows))
+    tools = sorted(set(r['tool'] for r in rows))
+    n_samples = len(set(r['sample'] for r in rows))
+
+    lines.append('toil-vcfcomp summary')
+    lines.append('====================')
+    lines.append('')
+    lines.append('callsets  : {}{}'.format(', '.join(callsets),
+                                           '   (baseline: {})'.format(callsets[0]) if len(callsets) > 1 else ''))
+    lines.append('truthsets : {}'.format(', '.join(truthsets)))
+    lines.append('samples   : {}'.format(n_samples))
+    lines.append('tools     : {}'.format(', '.join('{} (comparison={})'.format(
+        t, comparison or primary_comparison.get(t, 'GT')) for t in tools)))
+    lines.append('')
+
+    header, compare_rows, compare_callsets = build_comparison(summary_rows, callsets,
+                                                              comparison=comparison)
+
+    if len(compare_callsets) > 1:
+        wins = {}
+        for row in compare_rows:
+            if row['best']:
+                wins[row['best']] = wins.get(row['best'], 0) + 1
+        total = sum(wins.values())
+        if total:
+            winner = max(wins, key=lambda c: wins[c])
+            lines.append('VERDICT: {} has the better F1 on {} of {} (tool, truthset, variant type) '
+                         'combinations.'.format(winner, wins[winner], total))
+            others = ', '.join('{}: {}'.format(c, wins.get(c, 0)) for c in compare_callsets if c != winner)
+            if others:
+                lines.append('         ({})'.format(others))
+        lines.append('')
+
+    # headline: the ALL row, with recall and precision alongside F1 so a precision/recall swap
+    # is visible rather than hidden inside the F1
+    table = []
+    for row in sorted(heads, key=lambda r: (r['tool'], r['truthset'],
+                                            callsets.index(r['callset']) if r['callset'] in callsets else 0)):
+        if row['variant_type'] != 'ALL':
+            continue
+        table.append([row['tool'], row['truthset'], row['callset'], row['samples'],
+                      row['recall_mean'][:7], row['precision_mean'][:7], row['f1_mean'][:7]])
+    if table:
+        lines.append('Headline  (variant_type=ALL, mean across samples)')
+        lines += ['  ' + l for l in _fmt_table(
+            ['tool', 'truthset', 'callset', 'n', 'recall', 'precis.', 'F1'], table)]
+        lines.append('')
+
+    if compare_rows:
+        title = 'F1 by variant type' + (' (delta = last callset - baseline)' if len(compare_callsets) > 1 else '')
+        lines.append(title)
+        display = ['truthset', 'variant_type'] + compare_callsets + (
+            ['delta', 'best'] if len(compare_callsets) > 1 else [])
+        table = []
+        for row in compare_rows:
+            cells = [row['truthset'], row['variant_type']] + \
+                    [row[c][:7] if row[c] else '-' for c in compare_callsets]
+            if len(compare_callsets) > 1:
+                cells += [row['delta'][:9] if row['delta'] else '-', row['best'] or '-']
+            table.append(cells)
+        lines += ['  ' + l for l in _fmt_table(display, table)]
+        lines.append('')
+
+    lines.append('Full tables: report.tsv (per sample), report.summary.tsv (across samples), '
+                 'report.compare.tsv (head to head), report.chrom.tsv (per contig).')
+
+    with open(path, 'w') as out_file:
+        out_file.write('\n'.join(lines) + '\n')
+    return header, compare_rows
+
+
+def write_report(rows, chrom_rows, out_dir, prefix='report', callset_order=None, comparison=None):
+    """ write the report tables and return their paths """
     paths = {}
 
     rows = sorted(rows, key=lambda r: (r['callset'], r['truthset'], r['sample'], r['tool'],
@@ -270,6 +430,14 @@ def write_report(rows, chrom_rows, out_dir, prefix='report'):
     header, summary_rows = summarize(rows)
     paths['summary'] = os.path.join(out_dir, prefix + '.summary.tsv')
     write_tsv(summary_rows, header, paths['summary'])
+
+    paths['text'] = os.path.join(out_dir, prefix + '.txt')
+    compare_header, compare_rows = write_summary_text(rows, summary_rows, paths['text'],
+                                                      callset_order=callset_order,
+                                                      comparison=comparison)
+    if compare_rows:
+        paths['compare'] = os.path.join(out_dir, prefix + '.compare.tsv')
+        write_tsv(compare_rows, compare_header, paths['compare'])
 
     if chrom_rows:
         paths['chrom'] = os.path.join(out_dir, prefix + '.chrom.tsv')

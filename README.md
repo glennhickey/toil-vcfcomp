@@ -198,12 +198,39 @@ whatever succeeded, the failures are listed, and the run is only called a failur
 
 ```
 report/
+  report.txt          READ THIS FIRST -- headline numbers, F1 by variant type, and which
+                      callset won. a few dozen lines whatever the run size
+  report.compare.tsv  the same head-to-head, machine readable: callsets as columns,
+                      signed delta against the first --queryVcf, and the winner
   report.tsv          one row per (callset, truthset, sample, tool, comparison, region, filter, variant type)
   report.summary.tsv  the same collapsed across samples, grouped by callset and truthset:
                       n, mean/median/min/max of recall/precision/f1
   report.chrom.tsv    per-contig FP/FN counts, long form
   <callset>/<truthset>/<sample>/<tool>/    that comparison's summary files
 ```
+
+`report.tsv` is deliberately verbose — aardvark alone emits 45 rows per comparison (five
+comparison modes × nine variant types), so a couple of hundred samples is a very large table.
+`report.txt` is the digest:
+
+```
+VERDICT: hprc-v2.1-mc-chm13.wave has the better F1 on 7 of 10 (tool, truthset, variant type) combinations.
+
+Headline  (variant_type=ALL, mean across samples)
+  tool      truthset     callset                  n  recall   precis.  F1
+  aardvark  v5.0q_smvar  hprc-v2.0-mc-chm13.wave  1  0.98375  0.98276  0.98326
+  aardvark  v5.0q_smvar  hprc-v2.1-mc-chm13.wave  1  0.98502  0.98440  0.98471
+
+F1 by variant type (delta = last callset - baseline)
+  truthset     variant_type  hprc-v2.0-...  hprc-v2.1-...  delta      best
+  v5.0q_smvar  ALL           0.98326        0.98471        +0.001450  hprc-v2.1-...
+  v5.0q_smvar  Insertion     0.97271        0.96982        -0.002890  hprc-v2.0-...
+```
+
+It shows each tool's genotype-aware comparison only (`GT` for aardvark/vcfeval/hap.py, `ALLELE`
+for truvari, which does not require a genotype match), unstratified by region or filter, so the
+numbers in it are like-for-like. Recall and precision sit next to F1 in the headline block so a
+precision/recall swap is visible rather than buried inside the F1.
 
 Each tool reports its headline numbers in its own format (aardvark `summary.tsv`, vcfeval
 `summary.txt`, truvari `summary.json`, hap.py `*.summary.csv`); all four are normalised onto
