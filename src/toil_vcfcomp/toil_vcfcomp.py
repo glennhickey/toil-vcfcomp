@@ -10,7 +10,9 @@ per-sample results are collected into a single report.
 
 Several query VCFs can be given at once.  Each is a callset, benchmarked against the same truth
 and reported side by side, so graphs can be compared directly rather than by diffing two runs.
-Each sample's truth is fetched once and shared by every callset.
+Each sample's truth is fetched once and shared by every callset.  A callset is named after its
+file, or explicitly with --queryVcf NAME=path, which is worth doing when the files are named after
+their release directories and so collide.
 
 Example:
 
@@ -117,7 +119,7 @@ def vcfcomp_workflow(job, options, manifest_rows, query_ids, ref_id, ref_fai_id)
         split_job = root_job.addChildJobFn(split_query, options, callset, path, vcf_id, tbi_id,
                                            truth_samples,
                                            disk=split_disk(options, vcf_id, len(truth_samples)),
-                                           memory=clamp_memory(options.splitMemory))
+                                           memory=split_memory(options, len(truth_samples)))
         split_rvs[callset] = split_job.rv()
 
     # everything the reference needs -- decompressing, indexing, and the rtg SDF -- happens in one
@@ -133,6 +135,23 @@ def vcfcomp_workflow(job, options, manifest_rows, query_ids, ref_id, ref_fai_id)
     fan_job = root_job.addFollowOnJobFn(compare_all_samples, options, manifest_rows, split_rvs,
                                         ref_job.rv('fasta'), ref_job.rv('fai'), ref_job.rv('sdf'))
     return fan_job.rv()
+
+
+def split_memory(options, n_truth_samples):
+    """ memory for one split job.
+
+    bcftools +split scales with the number of samples it writes out, not with the input size.
+    Measured on chr1 of a 232-sample pangenome VCF: splitting 231 samples peaked at 9.8 GB and took
+    52 minutes, splitting one sample peaked at 0.35 GB and took 39 seconds.  So a run against a
+    single-sample truth set (GIAB, say) needs a fraction of what a whole-cohort run does, and a
+    flat default is wrong for one or the other.
+
+    Scaling within a sample count is superlinear in the records handled and has not been measured
+    at whole-genome scale, so this is a floor rather than a guarantee -- pair it with --doubleMem.
+    """
+    if options.splitMemory:
+        return clamp_memory(options.splitMemory)
+    return clamp_memory(max(4 * 2 ** 30, int(0.1 * 2 ** 30 * max(1, n_truth_samples))))
 
 
 def split_disk(options, vcf_id, n_truth_samples):
@@ -718,10 +737,27 @@ def collect_query_contigs(options, manifest_rows):
     return contigs
 
 
-def callset_labels(paths):
-    """ name each query VCF for the report.  the basename without its extensions is the obvious
-    label, but two callsets can share one (eg chr20/mc.vcf.gz and chr21/mc.vcf.gz), so anything
-    ambiguous falls back to a path that distinguishes them """
+def split_query_spec(spec):
+    """ 'NAME=path' -> ('NAME', 'path'), anything else -> (None, spec).
+
+    Only treated as a label when what precedes the first '=' looks like a name rather than part
+    of a path, so a filename or URL containing '=' is left alone.
+    """
+    if '=' in spec:
+        head, tail = spec.split('=', 1)
+        if head and tail and '/' not in head and ':' not in head:
+            return head, tail
+    return None, spec
+
+
+def callset_labels(specs):
+    """ name each query VCF for the report.
+
+    An explicit NAME=path wins.  Otherwise the basename without its extensions is the obvious
+    label, but several callsets can share one (release directories tend to name the file after the
+    directory), so a clash falls back to including the parent directory -- which is unambiguous but
+    long, and a sign that NAME=path would read better.
+    """
     def strip(path):
         name = os.path.basename(path)
         for suffix in ['.vcf.gz', '.vcf.bgz', '.bcf', '.vcf']:
@@ -729,17 +765,31 @@ def callset_labels(paths):
                 return name[:-len(suffix)]
         return name
 
-    labels = [strip(p) for p in paths]
+    given = [split_query_spec(s)[0] for s in specs]
+    paths = [split_query_spec(s)[1] for s in specs]
+
+    auto = [strip(p) for p in paths]
     out = []
-    for label, path in zip(labels, paths):
-        if labels.count(label) > 1:
+    for explicit, label, path in zip(given, auto, paths):
+        if explicit:
+            out.append(explicit)
+            continue
+        if auto.count(label) > 1:
             parent = os.path.basename(os.path.dirname(os.path.abspath(path)))
             label = '{}.{}'.format(parent, label) if parent else label
         out.append(label)
-    if len(set(out)) != len(out):
-        raise SystemExit('Could not derive distinct callset names from: {}. Rename the files so '
-                         'their basenames differ.'.format(', '.join(paths)))
+
+    duplicates = sorted(set(l for l in out if out.count(l) > 1))
+    if duplicates:
+        raise SystemExit('Could not derive distinct callset names: {} appears more than once. '
+                         'Name them explicitly with --queryVcf NAME=path.'.format(
+                             ', '.join(duplicates)))
     return out
+
+
+def callset_paths(specs):
+    """ the paths, with any NAME= prefix removed """
+    return [split_query_spec(s)[1] for s in specs]
 
 
 def parse_sample_list(value):
@@ -829,12 +879,11 @@ def main():
                         help='memory for each comparison job [32Gi]')
     parser.add_argument('--compareDisk', type=human2bytesN, default='20Gi',
                         help='disk for each comparison job, on top of 5x the reference size [20Gi]')
-    parser.add_argument('--splitMemory', type=human2bytesN, default='24Gi',
-                        help='memory for each query-split job. bcftools +split grows superlinearly '
-                        'with the records it handles: splitting a 232-sample pangenome VCF 231 ways '
-                        'peaked at 0.7Gi for chr21 but 9.8Gi for chr1 (0.9 vs 2.9 Gi per million '
-                        'records), so a whole-genome split needs far more than the biggest single '
-                        'chromosome suggests. pair with --doubleMem [24Gi]')
+    parser.add_argument('--splitMemory', type=human2bytesN, default=None,
+                        help='memory for each query-split job. the default scales with the number of '
+                        'truth samples (0.1Gi each, floor 4Gi), because bcftools +split scales with '
+                        'the samples it writes out: on chr1 of a 232-sample pangenome VCF, 231 '
+                        'samples peaked at 9.8Gi and one sample at 0.35Gi. pair with --doubleMem')
     parser.add_argument('--splitDisk', type=human2bytesN, default=None,
                         help='disk for each query-split job. the default scales with the number of '
                         'truth samples, because splitting one multi-sample VCF into N single-sample '
@@ -867,6 +916,10 @@ def main():
                        'discards every record whose FILTER is "." -- which is most of them. Consider '
                        'dropping it and relying on --truthFilter instead.')
 
+    # --queryVcf entries may be NAME=path; resolve both halves once, here
+    options.callsets = callset_labels(options.queryVcf)
+    options.queryVcf = callset_paths(options.queryVcf)
+
     options.samples = parse_sample_list(options.samples)
     options.docker = {'aardvark': options.aardvarkDocker, 'vcfeval': options.vcfevalDocker,
                       'truvari': options.truvariDocker, 'happy': options.happyDocker}
@@ -880,7 +933,8 @@ def main():
     # downloaded.  catch it in the first second instead
     max_mem = int(os.environ['VCFCOMP_MAX_MEMORY'])
     for flag, value in [('--compareMemory', options.compareMemory), ('--splitMemory', options.splitMemory)]:
-        if value > max_mem:
+        # splitMemory defaults to None, meaning "derive it from the truth sample count"
+        if value is not None and value > max_mem:
             raise SystemExit('{} is {} but the largest job this batch system will accept is {}. '
                              'Lower {} or raise --maxMemory.'.format(
                                  flag, bytes2human(value), bytes2human(max_mem), flag))
@@ -900,7 +954,6 @@ def main():
             # checked against these in prepare_reference, once the .fai exists
             options.queryContigs = collect_query_contigs(options, manifest_rows)
 
-            options.callsets = callset_labels(options.queryVcf)
             query_ids = []
             for callset, query_vcf in zip(options.callsets, options.queryVcf):
                 query_vcf_id = toil.importFile(makeURL(query_vcf))
