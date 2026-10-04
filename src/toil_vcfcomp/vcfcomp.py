@@ -93,6 +93,26 @@ def check_contigs_preserved(input_vcf, output_vcf):
             '--ref fasta does not contain that contig, or the input was truncated. Refusing to '
             'continue with a partial VCF.'.format(', '.join(sorted(lost)), os.path.basename(output_vcf)))
 
+def uppercase_alleles(var):
+    """ uppercase a record's sequence alleles, in place.
+
+    VCF bases are case-insensitive, but aardvark compares them case-sensitively, and a soft-masked
+    reference such as hs1 puts lowercase into both sides.  bcftools norm copies the bases of every
+    record it shifts out of the reference, so an indel left-aligned into a repeat comes out
+    lowercase while the same indel on the other side, already left-aligned and so untouched, stays
+    uppercase: one FN plus one FP.  And a truth set called against that reference (dipcall's are)
+    has lowercase REF bases all through its repeats.
+
+    Only plain sequence is touched: a breakend allele carries its mate's contig name, which is
+    case-sensitive, and a symbolic allele is a name rather than bases.
+    """
+    alleles = var.alleles
+    if alleles is None or len(alleles) < 2:
+        return
+    upper = tuple(allele.upper() if allele.isalpha() else allele for allele in alleles)
+    if upper != alleles:
+        var.alleles = upper
+
 def vcf_preprocess(input_vcf,
                    output_vcf,
                    ref_fasta,
@@ -111,6 +131,8 @@ def vcf_preprocess(input_vcf,
 
     haploid_x flattens chrX outside the pseudoautosomal regions only -- inside them a male really
     does have two copies, and collapsing those would throw away every heterozygous PAR call.
+
+    Alleles always come out uppercase (see uppercase_alleles).
     """
 
     output_dir = os.path.dirname(output_vcf)
@@ -173,7 +195,7 @@ def vcf_preprocess(input_vcf,
     tmp_vcf_file = pysam.VariantFile(tmp_vcf, 'rb')
     output_vcf_file = pysam.VariantFile(output_vcf, 'w', header=tmp_vcf_file.header)
 
-    sys.stderr.write('Correcting/removing chrX,chrY,chrM GTs\n')
+    sys.stderr.write('Correcting/removing chrX,chrY,chrM GTs and uppercasing alleles\n')
     for var in tmp_vcf_file.fetch():
         contig = var.contig.lower()
         skip = ('chry' in contig and remove_y) or 'chrm' in contig
@@ -187,6 +209,7 @@ def vcf_preprocess(input_vcf,
                     sample['GT'] = tuple([haploid_allele(gt)])
 
         if not skip:
+            uppercase_alleles(var)
             output_vcf_file.write(var)
 
     tmp_vcf_file.close()
