@@ -498,17 +498,17 @@ def run_comparison(job, options, callset, truthset, sample, tool, query_vcf_id, 
 
     # unlike the GIAB truth sets vcfcomp was written against, dipcall output is not preconditioned:
     # it is unnormalized, and hemizygous chrX/chrY come through as .|1 / 1|. .  so both sides get
-    # the same treatment here
+    # the same treatment here, --noNormalize included
     par_regions = vcfcomp.parse_par_bed(options.parBed) if options.parBed else None
 
     truth_prepped = os.path.join(out_dir, '{}.truth.prep.vcf.gz'.format(sample))
     vcfcomp.vcf_preprocess(truth_vcf, truth_prepped, ref_path, remove_y, haploid_x, sample,
-                           min_length, max_length, bi_allelic, True,
+                           min_length, max_length, bi_allelic, not options.noNormalize,
                            filter_expr=options.truthFilter, par_regions=par_regions)
 
     query_prepped = os.path.join(out_dir, '{}.query.prep.vcf.gz'.format(sample))
     vcfcomp.vcf_preprocess(query_vcf, query_prepped, ref_path, remove_y, haploid_x, sample,
-                           min_length, max_length, bi_allelic, True,
+                           min_length, max_length, bi_allelic, not options.noNormalize,
                            filter_expr=options.queryFilter, par_regions=par_regions)
 
     sdf_path = untar_sdf(job, sdf_id, work_dir, out_dir) if sdf_id else None
@@ -671,7 +671,8 @@ def make_report(job, options, results):
                            'unparseable summary. Check the job logs for the individual samples.')
 
     paths = report.write_report(rows, chrom_rows, work_dir,
-                                callset_order=getattr(options, 'callsets', None))
+                                callset_order=getattr(options, 'callsets', None),
+                                normalize=not options.noNormalize)
     RealtimeLogger.info('Report covers {} rows from {} callset/truthset/sample/tool comparisons'.format(
         len(rows), len(set((r['callset'], r['truthset'], r['sample'], r['tool']) for r in rows))))
     file_ids = dict((name, job.fileStore.writeGlobalFile(path)) for name, path in paths.items())
@@ -843,6 +844,13 @@ def main():
                         'FILTER="." rather than PASS ["{}"]'.format(vcfcomp.default_filter_expr))
     parser.add_argument('--queryFilter', default=None,
                         help='bcftools expression for the query records to keep [keep everything]')
+    parser.add_argument('--noNormalize', action='store_true',
+                        help='do not left-align indels (bcftools norm -f -cw) in truth or query. '
+                        'exact duplicates are still removed and alleles uppercased. norm shifts each '
+                        'indel on its own, so two indels in one repeat on the same haplotype can '
+                        'land on top of each other and score as errors. use this when no haplotype '
+                        'has overlapping records, as in top-level vg deconstruct output. '
+                        'report.txt records which mode was used')
     parser.add_argument('--splitFilter', default='GT~"[1-9]"',
                         help='bcftools expression for which records to keep when splitting the query '
                         'into single-sample VCFs. the default keeps any genotype carrying a non-ref '

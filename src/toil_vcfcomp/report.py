@@ -342,8 +342,11 @@ def _fmt_table(header, rows, aligns=None):
     return out
 
 
-def write_summary_text(rows, summary_rows, path, callset_order=None, comparison=None):
-    """ the file to open first: what ran, the headline numbers, and which callset won """
+def write_summary_text(rows, summary_rows, path, callset_order=None, comparison=None,
+                       normalize=None):
+    """ the file to open first: what ran, the headline numbers, and which callset won.
+    normalize is whether indels were left-aligned in preprocessing; None (a report rebuilt from
+    tool outputs alone) leaves it unsaid rather than guessing """
     lines = []
     heads = headline_rows(summary_rows, comparison)
     callsets = callset_order or sorted(set(r['callset'] for r in rows))
@@ -360,6 +363,11 @@ def write_summary_text(rows, summary_rows, path, callset_order=None, comparison=
     lines.append('samples   : {}'.format(n_samples))
     lines.append('tools     : {}'.format(', '.join('{} (comparison={})'.format(
         t, comparison or primary_comparison.get(t, 'GT')) for t in tools)))
+    # error counts move a lot between the two modes, so a report must say which one it used
+    if normalize is not None:
+        lines.append('normalize : {}'.format(
+            'yes (bcftools norm -f -cw: indels left-aligned)' if normalize else
+            'no (--noNormalize: indels as called; exact duplicates removed, alleles uppercased)'))
     lines.append('')
 
     header, compare_rows, compare_callsets = build_comparison(summary_rows, callsets,
@@ -418,7 +426,8 @@ def write_summary_text(rows, summary_rows, path, callset_order=None, comparison=
     return header, compare_rows
 
 
-def write_report(rows, chrom_rows, out_dir, prefix='report', callset_order=None, comparison=None):
+def write_report(rows, chrom_rows, out_dir, prefix='report', callset_order=None, comparison=None,
+                 normalize=None):
     """ write the report tables and return their paths """
     paths = {}
 
@@ -434,7 +443,8 @@ def write_report(rows, chrom_rows, out_dir, prefix='report', callset_order=None,
     paths['text'] = os.path.join(out_dir, prefix + '.txt')
     compare_header, compare_rows = write_summary_text(rows, summary_rows, paths['text'],
                                                       callset_order=callset_order,
-                                                      comparison=comparison)
+                                                      comparison=comparison,
+                                                      normalize=normalize)
     if compare_rows:
         paths['compare'] = os.path.join(out_dir, prefix + '.compare.tsv')
         write_tsv(compare_rows, compare_header, paths['compare'])

@@ -132,7 +132,12 @@ def vcf_preprocess(input_vcf,
     haploid_x flattens chrX outside the pseudoautosomal regions only -- inside them a male really
     does have two copies, and collapsing those would throw away every heterozygous PAR call.
 
-    Alleles always come out uppercase (see uppercase_alleles).
+    normalize left-aligns indels against ref_fasta (bcftools norm -f -cw).  Turn it off for a VCF
+    with no overlapping records on a haplotype, such as top-level vg deconstruct output: norm
+    shifts each indel on its own, so two indels in one repeat on the same haplotype can be pushed
+    onto each other, and the haplotype aardvark rebuilds is then not the one the VCF spelled.
+
+    Exact duplicates are removed and alleles come out uppercase (see uppercase_alleles) either way.
     """
 
     output_dir = os.path.dirname(output_vcf)
@@ -172,22 +177,27 @@ def vcf_preprocess(input_vcf,
         subprocess.check_call(['tabix', '-fp', 'vcf', norm_vcf])
         remove_vcf(tmp_vcf)
         tmp_vcf = norm_vcf
+    # removing exact duplicates needs no reference, so it happens whether or not we normalize
     if normalize:
-        sys.stderr.write('Normalizing indels with bcftools\n')
-        norm_vcf = tmp_vcf.replace('.vcf', '.norm.vcf')
-        # -T keeps bcftools sort's spill inside the output directory.  the default is $TMPDIR,
-        # which under a batch system is node-local /tmp: outside the job's disk request, invisible
-        # to --workDir, and left behind whenever the job is killed
-        sort_tmp = os.path.join(output_dir, 'bcftools-sort-tmp')
-        with open(norm_vcf, 'w') as norm_vcf_file:
-            run_pipe(f'bcftools norm -f {ref_fasta} {tmp_vcf} -Oz -d exact -cw | '
-                     f'bcftools sort -T {shlex.quote(sort_tmp)} | bgzip',
-                     stdout=norm_vcf_file)
-        shutil.rmtree(sort_tmp, ignore_errors=True)
-        subprocess.check_call(['tabix', '-fp', 'vcf', norm_vcf])
-        check_contigs_preserved(tmp_vcf, norm_vcf)
-        remove_vcf(tmp_vcf)
-        tmp_vcf = norm_vcf
+        sys.stderr.write('Normalizing indels and removing exact duplicates with bcftools\n')
+        norm_opts = f'-f {ref_fasta} -d exact -cw'
+    else:
+        sys.stderr.write('Removing exact duplicates with bcftools (indels not normalized)\n')
+        norm_opts = '-d exact'
+    norm_vcf = tmp_vcf.replace('.vcf', '.norm.vcf')
+    # -T keeps bcftools sort's spill inside the output directory.  the default is $TMPDIR,
+    # which under a batch system is node-local /tmp: outside the job's disk request, invisible
+    # to --workDir, and left behind whenever the job is killed
+    sort_tmp = os.path.join(output_dir, 'bcftools-sort-tmp')
+    with open(norm_vcf, 'w') as norm_vcf_file:
+        run_pipe(f'bcftools norm {norm_opts} {tmp_vcf} -Oz | '
+                 f'bcftools sort -T {shlex.quote(sort_tmp)} | bgzip',
+                 stdout=norm_vcf_file)
+    shutil.rmtree(sort_tmp, ignore_errors=True)
+    subprocess.check_call(['tabix', '-fp', 'vcf', norm_vcf])
+    check_contigs_preserved(tmp_vcf, norm_vcf)
+    remove_vcf(tmp_vcf)
+    tmp_vcf = norm_vcf
 
     subprocess.check_call(['tabix', '-fp', 'vcf', tmp_vcf])
 
@@ -735,7 +745,7 @@ def download_q100(dict_only=False):
     return name_dict
                                  
 def eval_q100(out_dir, grch38_vcfs, chm13_vcfs, download, min_length, max_length, threads, eval_type,
-              happy_options, truvari_options, vcfeval_options, aardvark_options):
+              happy_options, truvari_options, vcfeval_options, aardvark_options, normalize=True):
     """ run q100 hap.py and truvari evaluation on set of input vcfs and
     tabulate the results """
 
@@ -762,7 +772,7 @@ def eval_q100(out_dir, grch38_vcfs, chm13_vcfs, download, min_length, max_length
                            min_length,
                            max_length,
                            False,
-                           True)        
+                           normalize)        
             # run hap.py
             happy(name_dict[('GRCh38' if is_grch38 else 'CHM13v2.0', 'smvar', 'vcf.gz')],
                   hap_calls,
@@ -790,7 +800,7 @@ def eval_q100(out_dir, grch38_vcfs, chm13_vcfs, download, min_length, max_length
                            min_length,
                            max_length,
                            True,
-                           True)
+                           normalize)
         
             # run truvari
             truvari(name_dict[('GRCh38' if is_grch38 else 'CHM13v2.0', 'stvar', 'vcf.gz')],
@@ -818,7 +828,7 @@ def eval_q100(out_dir, grch38_vcfs, chm13_vcfs, download, min_length, max_length
                            min_length,
                            max_length,
                            False,
-                           True)
+                           normalize)
             # run vcfeval
             vcfeval(name_dict[('GRCh38' if is_grch38 else 'CHM13v2.0', 'smvar', 'vcf.gz')],
                     hap_calls,
@@ -846,7 +856,7 @@ def eval_q100(out_dir, grch38_vcfs, chm13_vcfs, download, min_length, max_length
                            min_length,
                            default_aardvark_max_length,
                            False,
-                           True)
+                           normalize)
             # run aardvark
             # note we compare all variants here
             aardvark(name_dict[('GRCh38' if is_grch38 else 'CHM13v2.0', 'stvar', 'vcf.gz')],
@@ -1028,6 +1038,17 @@ def main(command_line=None):
         tool_parser.add_argument('--par-bed',
                                  help='BED of pseudoautosomal regions, where --haploid-x must not '
                                  'flatten genotypes. defaults to the GRCh38 PARs; pass CHM13 ones here')
+    # and by every subcommand that preprocesses
+    for tool_parser in [happy_parser, truvari_parser, vcfeval_parser, aardvark_parser,
+                        hg002_q100_eval_parser]:
+        tool_parser.add_argument('--no-normalize', action='store_true',
+                                 help='do not left-align the calls\' indels with bcftools norm -f -cw '
+                                 '(exact duplicates are still removed and alleles uppercased; the '
+                                 'truth is never preprocessed by these subcommands). norm shifts '
+                                 'each indel on its own, so two indels in one repeat on the same '
+                                 'haplotype can land on top of each other: use this for VCFs with no '
+                                 'overlapping records on a haplotype, such as top-level vg '
+                                 'deconstruct output')
     happy_parser.add_argument('--sdf',
                               help='prebuilt rtg SDF, passed to hap.py as --engine-vcfeval-template '
                               'so it does not rebuild one per run')
@@ -1064,7 +1085,7 @@ def main(command_line=None):
                        0,
                        args.max_length,
                        True,
-                       True,
+                       not args.no_normalize,
                        par_regions=par_regions)
 
         # run happy
@@ -1086,7 +1107,7 @@ def main(command_line=None):
                        default_aardvark_min_length,
                        default_aardvark_max_length,
                        True,
-                       True,
+                       not args.no_normalize,
                        par_regions=par_regions)
 
         # run truvari
@@ -1107,7 +1128,7 @@ def main(command_line=None):
                        0,
                        args.max_length,
                        False,
-                       True,
+                       not args.no_normalize,
                        par_regions=par_regions)
 
         # run vcfeval
@@ -1130,7 +1151,7 @@ def main(command_line=None):
                        args.min_length,
                        args.max_length,
                        False,
-                       True,
+                       not args.no_normalize,
                        par_regions=par_regions)
         
         # run aardvark
@@ -1174,7 +1195,8 @@ def main(command_line=None):
                   args.happy_options,
                   args.truvari_options,
                   args.vcfeval_options,
-                  args.aardvark_options)
+                  args.aardvark_options,
+                  normalize=not args.no_normalize)
 
             
 if __name__ == '__main__':

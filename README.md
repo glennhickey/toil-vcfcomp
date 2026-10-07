@@ -183,6 +183,10 @@ What it does:
   `--regions` if given.
 - Preprocesses **both** sides. `vcfcomp` alone assumes the truth is a ready-to-use GIAB benchmark;
   dipcall output is not, so it gets the same normalization and ploidy handling as the query.
+  Normalization is `bcftools norm -f <ref> -cw -d exact`: it left-aligns indels and drops records
+  with the same position, REF and ALT (genotypes are not compared). Alleles are also uppercased.
+  `--noNormalize` skips the left-alignment but keeps the duplicate removal and uppercasing (see
+  below for when to use it). `report.txt` says which mode a run used.
 - Applies an allele-length filter to both sides: `--maxLength` (default 1000) for the
   small-variant tools (hap.py, vcfeval) and `--svMaxLength` (default 100000) for the SV-aware ones
   (aardvark, truvari), with `--minLength` (default 0) as the floor. These bound the truth set as
@@ -333,6 +337,16 @@ overlay support silently skips a bind whose destination does not exist.
 When `--binariesMode` is not given it is autodetected, preferring singularity whenever
 `--batchSystem` is not `single_machine` — the submit node commonly has docker while the compute
 nodes do not, so probing for docker there would pick a runtime no worker can use.
+
+**Normalization can manufacture errors.** `bcftools norm` left-aligns each indel on its own. If a
+haplotype has two indels in one repeat, or an indel beside a SNP, they can be shifted onto the
+same bases. aardvark then rebuilds a haplotype the VCF never spelled, and scores FPs and FNs that
+are not in the calls. Top-level vg deconstruct output should have no overlapping records on a
+haplotype (the samples checked in the graph below had none), so `--noNormalize` scores a graph VCF
+as written. On chr16 of a CHM13 30-way graph, normalizing both sides gave 19-33% more aardvark
+errors against dipcall, over four sample × graph pairs. It gave 2.4-2.6x as many against the Q100
+HG002 small variants (1,306 and 1,397 errors, against 541 for both graphs without it). That turned
+no difference between the two graphs into a +91 error regression.
 
 **The reference must match.** `bcftools norm -c w` passes a reference-mismatched record through
 unchanged and exits 0, so the wrong `--ref` yields a completed run full of plausible, wrong
