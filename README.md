@@ -173,8 +173,10 @@ their parent directory.
 
 What it does:
 
-- Splits the query into single-sample VCFs in **one pass** with `bcftools +split`, rather than a
-  `bcftools view` per sample over the whole file.
+- Splits the query into single-sample VCFs with `bcftools +split`, rather than a `bcftools view`
+  per sample over the whole file. The split runs as `--threads` `+split` processes side by side,
+  each over its own batch of samples: nearly all of the cost is per output sample, so re-reading
+  the input once per batch is cheap.
 - Builds the rtg SDF **once** when `vcfeval` is requested, instead of once per comparison.
 - Works out each sample's sex from its truth VCF -- chrY records are present if and only if the
   sample is male -- and sets the haploid-X / exclude-Y handling (and hap.py's `--gender`)
@@ -358,3 +360,4 @@ headers and refuses to continue on a mismatch, before any comparison runs.
 Per-comparison resources are `--threads` cores, `--compareMemory` (default 32Gi) and
 `5 x <reference size> + --compareDisk` (default 20Gi) of disk. Slurm enforces memory through
 cgroups, so lower these if your jobs are being killed and raise them if aardvark runs out.
+Each query split also takes `--threads` cores, one per batch of samples.

@@ -118,6 +118,7 @@ def vcfcomp_workflow(job, options, manifest_rows, query_ids, ref_id, ref_fai_id)
     for callset, path, vcf_id, tbi_id in query_ids:
         split_job = root_job.addChildJobFn(split_query, options, callset, path, vcf_id, tbi_id,
                                            truth_samples,
+                                           cores=split_cores(options, len(truth_samples)),
                                            disk=split_disk(options, vcf_id, len(truth_samples)),
                                            memory=split_memory(options, len(truth_samples)))
         split_rvs[callset] = split_job.rv()
@@ -137,6 +138,11 @@ def vcfcomp_workflow(job, options, manifest_rows, query_ids, ref_id, ref_fai_id)
     return fan_job.rv()
 
 
+def split_cores(options, n_truth_samples):
+    """ cores for one split job: one per bcftools +split batch, and no more batches than samples """
+    return max(1, min(options.threads, n_truth_samples))
+
+
 def split_memory(options, n_truth_samples):
     """ memory for one split job.
 
@@ -148,10 +154,16 @@ def split_memory(options, n_truth_samples):
 
     Scaling within a sample count is superlinear in the records handled and has not been measured
     at whole-genome scale, so this is a floor rather than a guarantee -- pair it with --doubleMem.
+
+    Splitting in parallel batches divides that per-sample memory between the processes rather than
+    adding to it, but each process holds its own input records on top: about 1 GB for one
+    process on a chr20 graph VCF with very long alleles, so add 1Gi per batch.
     """
     if options.splitMemory:
         return clamp_memory(options.splitMemory)
-    return clamp_memory(max(4 * 2 ** 30, int(0.1 * 2 ** 30 * max(1, n_truth_samples))))
+    per_sample = int(0.1 * 2 ** 30 * max(1, n_truth_samples))
+    per_batch = 2 ** 30 * split_cores(options, n_truth_samples)
+    return clamp_memory(max(4 * 2 ** 30, per_sample + per_batch))
 
 
 def split_disk(options, vcf_id, n_truth_samples):
@@ -162,10 +174,12 @@ def split_disk(options, vcf_id, n_truth_samples):
     staying near the input size.  Measured on a real 232-sample pangenome VCF the outputs came to
     11.4x the input for 231 samples -- about 0.05x the input per sample -- against the flat 4x
     this used to request, which was taken from a toy file and was wrong by 2.5x at real scale.
+    Two HPRC wave VCFs (2.3 and 2.4 GiB, 231 samples) then went over that, using 37 and 43 GiB,
+    or 0.065x-0.075x per sample; and -Oz3 writes files about 7% bigger than the default level did.
     """
     if options.splitDisk:
         return options.splitDisk
-    per_sample = 0.05 * max(1, n_truth_samples)
+    per_sample = 0.08 * max(1, n_truth_samples)
     # 1x for the local copy of the input, the rest for the outputs
     return int(vcf_id.size * (1.2 + per_sample)) + 4 * 2 ** 30
 
@@ -317,19 +331,31 @@ def split_query(job, options, callset, query_vcf, query_vcf_id, query_tbi_id, tr
                                query_vcf, options.truthIndex,
                                ', '.join(sorted(query_samples)[:5]), ', '.join(truth_samples[:5])))
 
-    samples_path = os.path.join(work_dir, 'shared-samples.txt')
-    with open(samples_path, 'w') as samples_file:
-        for sample in shared:
-            samples_file.write(sample + '\n')
-
+    # +split's cost is nearly all per output sample -- filtering, formatting and compressing each
+    # sample's records -- while reading the input is a small fixed cost.  so batches of samples
+    # split side by side, each re-reading the input, scale with the cores they get.  -Oz3 because
+    # on a graph VCF, whose ALT lists every allele at the site, the default level spent 7x as long
+    # per sample deflating, for files only 7% smaller.  the comparison jobs rewrite them anyway
     split_dir = os.path.join(work_dir, 'split')
     os.makedirs(split_dir)
-    split_cmd = ['bcftools', '+split', query_path, '-S', samples_path, '-Oz', '-o', split_dir,
-                 '-i', options.splitFilter]
-    if options.splitKeepTags:
-        split_cmd += ['-k', options.splitKeepTags]
-    RealtimeLogger.info('Splitting {} into {} single-sample VCFs'.format(query_vcf, len(shared)))
-    subprocess.check_call(split_cmd)
+    n_batches = max(1, min(int(job.cores), len(shared)))
+    procs = []
+    for i in range(n_batches):
+        samples_path = os.path.join(work_dir, 'shared-samples.{}.txt'.format(i))
+        with open(samples_path, 'w') as samples_file:
+            for sample in shared[i::n_batches]:
+                samples_file.write(sample + '\n')
+        split_cmd = ['bcftools', '+split', query_path, '-S', samples_path, '-Oz3', '-o', split_dir,
+                     '-i', options.splitFilter]
+        if options.splitKeepTags:
+            split_cmd += ['-k', options.splitKeepTags]
+        procs.append(subprocess.Popen(split_cmd))
+    RealtimeLogger.info('Splitting {} into {} single-sample VCFs, in {} parallel batches'.format(
+        query_vcf, len(shared), n_batches))
+    # wait on every batch before raising, so none is left writing into a directory being torn down
+    failed = [p for p in procs if p.wait() != 0]
+    if failed:
+        raise subprocess.CalledProcessError(failed[0].returncode, failed[0].args)
 
     sample_ids = {}
     for sample in shared:
@@ -828,7 +854,8 @@ def main():
     parser.add_argument('--regions',
                         help='global BED to intersect with each sample confident-region BED')
     parser.add_argument('--threads', type=int, default=8,
-                        help='threads (and cores requested) per comparison [8]')
+                        help='threads (and cores requested) per comparison, and per query split, '
+                        'which runs that many bcftools +split processes over batches of samples [8]')
     parser.add_argument('--minLength', type=int, default=vcfcomp.default_aardvark_min_length,
                         help='ignore sites whose alleles are all shorter than this [{}]'.format(
                             vcfcomp.default_aardvark_min_length))
@@ -889,14 +916,15 @@ def main():
                         help='disk for each comparison job, on top of 5x the reference size [20Gi]')
     parser.add_argument('--splitMemory', type=human2bytesN, default=None,
                         help='memory for each query-split job. the default scales with the number of '
-                        'truth samples (0.1Gi each, floor 4Gi), because bcftools +split scales with '
-                        'the samples it writes out: on chr1 of a 232-sample pangenome VCF, 231 '
-                        'samples peaked at 9.8Gi and one sample at 0.35Gi. pair with --doubleMem')
+                        'truth samples (0.1Gi each, plus 1Gi per --threads batch, floor 4Gi), '
+                        'because bcftools +split scales with the samples it writes out: on chr1 of a '
+                        '232-sample pangenome VCF, 231 samples peaked at 9.8Gi and one sample at '
+                        '0.35Gi. pair with --doubleMem')
     parser.add_argument('--splitDisk', type=human2bytesN, default=None,
                         help='disk for each query-split job. the default scales with the number of '
                         'truth samples, because splitting one multi-sample VCF into N single-sample '
-                        'ones repeats the site columns N times -- measured at 11x the input for 231 '
-                        'samples, not a fraction of it')
+                        'ones repeats the site columns N times -- measured at 11x-17x the input for '
+                        '231 samples, not a fraction of it')
     add_binaries_options(parser)
 
     options = parser.parse_args()
