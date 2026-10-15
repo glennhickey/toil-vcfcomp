@@ -211,7 +211,10 @@ report/
   report.tsv          one row per (callset, truthset, sample, tool, comparison, region, filter, variant type)
   report.summary.tsv  the same collapsed across samples, grouped by callset and truthset:
                       n, mean/median/min/max of recall/precision/f1
-  report.chrom.tsv    per-contig FP/FN counts, long form
+  report.chrom.tsv    per-contig FP/FN counts, long form.  aardvark adds true positives
+                      by size class (SNV, SMALL < 50 bp, SV50 = any allele >= 50 bp):
+                      <class>-TRUTH_TP, -FN, -QUERY_TP, -FP, enough for per-class
+                      recall, precision and F1
   <callset>/<truthset>/<sample>/<tool>/    that comparison's summary files
 ```
 

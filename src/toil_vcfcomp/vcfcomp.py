@@ -640,14 +640,33 @@ def aardvark_chromsplit(aardvark_outdir):
     def is_sv(var):
         """ this either """
         return any(len(a) >= 50 for a in var.alleles)
-    
+
+    # size classes, with true positives as well as errors, so that precision and recall can be
+    # computed per class: SV50 if any allele (REF included) is at least 50 bp, the same test as
+    # the SV-* rows; SNV if every allele is a single base; SMALL for the rest (indels, MNPs and
+    # complex records under 50 bp).  rows are <class>-TRUTH_TP, -FN, -QUERY_TP and -FP
+    size_classes = ['SNV', 'SMALL', 'SV50']
+    size_counts = defaultdict(int)
+    def size_class(var):
+        if is_sv(var):
+            return 'SV50'
+        return 'SNV' if all(len(a) == 1 for a in var.alleles) else 'SMALL'
+    def count_size(var, kind):
+        cls = size_class(var)
+        size_counts[(cls, kind, var.contig)] += 1
+        size_counts[(cls, kind, '_total_')] += 1
+
     fp_vcf = os.path.join(aardvark_outdir, 'query.vcf.gz')
     fp_vcf_file = pysam.VariantFile(fp_vcf, 'r')
     contigs = set(['_total_'])
     for var in fp_vcf_file.fetch():
         assert len(var.samples.values()) == 1
         sample = var.samples.values()[0]
+        if sample['BD'] == 'TP':
+            contigs.add(var.contig)
+            count_size(var, 'QUERY_TP')
         if sample['BD'] == 'FP':            
+            count_size(var, 'FP')
             contigs.add(var.contig)
             if is_sv(var):
                 snp_dict = sv_snp_fp
@@ -670,7 +689,11 @@ def aardvark_chromsplit(aardvark_outdir):
     for var in fn_vcf_file.fetch():
         assert len(var.samples.values()) == 1
         sample = var.samples.values()[0]
+        if sample['BD'] == 'TP':
+            contigs.add(var.contig)
+            count_size(var, 'TRUTH_TP')
         if sample['BD'] == 'FN':            
+            count_size(var, 'FN')
             contigs.add(var.contig)
             if is_sv(var):
                 snp_dict = sv_snp_fn
@@ -700,6 +723,10 @@ def aardvark_chromsplit(aardvark_outdir):
         output_table[-3].append(str(sv_snp_fn[contig]))
         output_table[-2].append(str(sv_indel_fp[contig]))
         output_table[-1].append(str(sv_indel_fn[contig]))        
+    for cls in size_classes:
+        for kind in ['TRUTH_TP', 'FN', 'QUERY_TP', 'FP']:
+            output_table.append(['{}-{}'.format(cls, kind)] +
+                                [str(size_counts[(cls, kind, contig)]) for contig in sorted(contigs)])
     
     return output_table
 
