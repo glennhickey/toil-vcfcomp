@@ -525,7 +525,16 @@ def run_comparison(job, options, callset, truthset, sample, tool, query_vcf_id, 
     # unlike the GIAB truth sets vcfcomp was written against, dipcall output is not preconditioned:
     # it is unnormalized, and hemizygous chrX/chrY come through as .|1 / 1|. .  so both sides get
     # the same treatment here, --noNormalize included
-    par_regions = vcfcomp.parse_par_bed(options.parBed) if options.parBed else None
+    if options.parBed:
+        par_regions = vcfcomp.parse_par_bed(options.parBed)
+    else:
+        ref_name, par_regions = vcfcomp.par_regions_for_reference(ref_path + '.fai')
+        if par_regions is not None:
+            RealtimeLogger.info('{}: male chrX flattened outside the {} PARs'.format(sample, ref_name))
+        else:
+            RealtimeLogger.warning('{}: the reference\'s chrX length is not one vcfcomp knows, so male '
+                                   'chrX is flattened outside the GRCh38 PARs. pass --parBed if that is '
+                                   'wrong'.format(sample))
 
     truth_prepped = os.path.join(out_dir, '{}.truth.prep.vcf.gz'.format(sample))
     vcfcomp.vcf_preprocess(truth_vcf, truth_prepped, ref_path, remove_y, haploid_x, sample,
@@ -891,7 +900,8 @@ def main():
                         'half the file, and which none of the comparison tools read [FMT/GT]')
     parser.add_argument('--parBed',
                         help='BED of pseudoautosomal regions, where a male is diploid and chrX must '
-                        'not be flattened. defaults to the GRCh38 PARs; pass CHM13 ones here')
+                        'not be flattened. defaults to the PARs of the --ref, when its chrX length '
+                        'identifies GRCh38 or CHM13v2.0 (hs1), else to GRCh38\'s')
     parser.add_argument('--maxFailedSamples', type=int, default=0,
                         help='how many per-sample comparisons may fail before the run is called a '
                         'failure. the report is written either way, covering whatever succeeded [0]')

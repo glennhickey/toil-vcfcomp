@@ -51,9 +51,26 @@ default_aardvark_options = '--enable-haplotype-metrics --enable-weighted-haploty
 # FILTER="." rather than PASS.  so the filter has to keep "." too -- a --pass-only style filter
 # would silently throw away about 96% of a dipcall truth set.
 default_filter_expr = 'FILTER="." || FILTER="PASS"'
-# GRCh38 pseudoautosomal regions.  a male is genuinely diploid here, so chrX in a PAR must not be
+# pseudoautosomal regions.  a male is genuinely diploid here, so chrX in a PAR must not be
 # flattened to haploid.  1-based inclusive, matching what dipcall uses for its -x par bed.
-default_par_regions = {'chrx': [(10001, 2781479), (155701383, 156030895)]}
+grch38_par_regions = {'chrx': [(10001, 2781479), (155701383, 156030895)]}
+chm13_par_regions = {'chrx': [(1, 2394410), (153925835, 154259566)]}
+default_par_regions = grch38_par_regions
+# the PARs follow the reference, which its chrX length identifies.  using GRCh38's on CHM13 flattens
+# CHM13's PAR2 in males and leaves X-specific 2,394,411-2,781,479 diploid
+par_regions_by_chrx_length = {156040895: ('GRCh38', grch38_par_regions),
+                              154259566: ('CHM13v2.0', chm13_par_regions)}
+
+def par_regions_for_reference(fai_path):
+    """ (name, PARs) of the reference whose .fai this is, recognized by its chrX length, or
+    (None, None) when it has no chrX or one of a length we do not know.  None as PARs means
+    in_par() falls back to the GRCh38 ones """
+    with open(fai_path) as fai_file:
+        for line in fai_file:
+            fields = line.split('\t')
+            if len(fields) >= 2 and fields[0].lower().split('#')[-1] in ('chrx', 'x'):
+                return par_regions_by_chrx_length.get(int(fields[1]), (None, None))
+    return None, None
 
 def run_pipe(command, stdout=None):
     """ run a shell pipeline and fail if ANY stage fails.
@@ -1064,7 +1081,8 @@ def main(command_line=None):
     for tool_parser in [happy_parser, truvari_parser, vcfeval_parser, aardvark_parser]:
         tool_parser.add_argument('--par-bed',
                                  help='BED of pseudoautosomal regions, where --haploid-x must not '
-                                 'flatten genotypes. defaults to the GRCh38 PARs; pass CHM13 ones here')
+                                 'flatten genotypes. defaults to the PARs of the --ref, when its chrX '
+                                 'length identifies GRCh38 or CHM13v2.0 (hs1) and it has a .fai, else GRCh38\'s')
     # and by every subcommand that preprocesses
     for tool_parser in [happy_parser, truvari_parser, vcfeval_parser, aardvark_parser,
                         hg002_q100_eval_parser]:
@@ -1082,6 +1100,8 @@ def main(command_line=None):
 
     args = parser.parse_args(command_line)
     par_regions = parse_par_bed(args.par_bed) if getattr(args, 'par_bed', None) else None
+    if par_regions is None and getattr(args, 'ref', None) and os.path.isfile(args.ref + '.fai'):
+        par_regions = par_regions_for_reference(args.ref + '.fai')[1]
 
     # only the commands that actually run a tool need this: no point probing for docker just to
     # tabulate an output directory
