@@ -215,7 +215,9 @@ report/
                       by size class (SNV, SMALL < 50 bp, SV50 = any allele >= 50 bp):
                       <class>-TRUTH_TP, -FN, -QUERY_TP, -FP, enough for per-class
                       recall, precision and F1
-  <callset>/<truthset>/<sample>/<tool>/    that comparison's summary files
+  <callset>/<truthset>/<sample>/<tool>/    that comparison's summary files; for aardvark
+                      also errors.tsv.gz, every FP and FN record (below), and for a truth
+                      set with one sample in the run, such as GIAB's, the annotated VCFs
 ```
 
 `report.tsv` is deliberately verbose — aardvark alone emits 45 rows per comparison (five
@@ -245,6 +247,23 @@ Each tool reports its headline numbers in its own format (aardvark `summary.tsv`
 `summary.txt`, truvari `summary.json`, hap.py `*.summary.csv`); all four are normalised onto
 aardvark's column set. `--exportAll` additionally exports each comparison's full output directory
 as a tarball -- off by default, since the fp/fn/tp VCFs for a few hundred samples add up.
+
+Two smaller per-record outputs sit between the summaries and `--exportAll`:
+
+- **`errors.tsv.gz`** (aardvark, always): one line per FP (query) and FN (truth) record, sorted by
+  position. Columns: `chrom pos end side class size_class ref_len alt_len gt ea oa ref alt ri`,
+  where `class` is the SNP/INDEL/SV-SNP/SV-INDEL of `report.chrom.tsv`'s rows, `size_class` is
+  SNV/SMALL/SV50, `ea`/`oa` are aardvark's expected and observed allele counts, alleles over 50 bp
+  are written as their length, `<123bp>`, and `ri` is aardvark's comparison region (records sharing
+  it were scored together). Under ~1 MB for a GIAB truth set, 1-2 MB per dipcall sample. It locates
+  errors, which the per-contig counts cannot. `ri` is numbered per run, so cut it off before
+  diffing two callsets' tables:
+  `diff <(zcat A/errors.tsv.gz | cut -f1-13) <(zcat B/errors.tsv.gz | cut -f1-13)`.
+- **Annotated VCFs** (`--exportVcfs`, default `auto`): each tool's TP/FP/FN-annotated VCFs and
+  their indexes (aardvark `query.vcf.gz`/`truth.vcf.gz`, vcfeval `tp`/`tp-baseline`/`fp`/`fn`,
+  truvari `tp-base`/`tp-comp`/`fp`/`fn`, hap.py `happy-output`). `auto` exports them for truth sets
+  with a single sample in the run, such as GIAB's (~165 MB per callset for HG002); `all` for every
+  truth set (~85 MB per dipcall sample, ~19 GB per 231-sample callset); `none` never.
 
 ## Worked examples
 

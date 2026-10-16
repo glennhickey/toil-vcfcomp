@@ -32,6 +32,7 @@ import shutil
 import shlex
 import glob
 import traceback
+from collections import defaultdict
 from urllib.parse import urlparse
 
 from toil.common import Toil
@@ -52,11 +53,18 @@ except ImportError:
     toil_vcfcomp_commit = 'unknown'
 
 # the tools each write their headline numbers to a different set of files.  these are the ones
-# worth keeping for every sample; --exportAll gets everything else
-summary_globs = {'aardvark': ['*.tsv'],
+# worth keeping for every sample; --exportAll gets everything else.  aardvark's errors.tsv.gz is
+# the FP/FN record table vcfcomp.aardvark_chromsplit writes
+summary_globs = {'aardvark': ['*.tsv', 'errors.tsv.gz'],
                  'vcfeval': ['summary.txt', 'phasing.txt'],
                  'truvari': ['summary.json', 'summary.txt', 'params.json'],
                  'happy': ['*.summary.csv', '*.extended.csv']}
+
+# each tool's per-record output VCFs (TP/FP/FN annotated or split), for --exportVcfs
+annotated_vcf_globs = {'aardvark': ['query.vcf.gz', 'truth.vcf.gz'],
+                       'vcfeval': ['tp.vcf.gz', 'tp-baseline.vcf.gz', 'fp.vcf.gz', 'fn.vcf.gz'],
+                       'truvari': ['tp-base.vcf.gz', 'tp-comp.vcf.gz', 'fp.vcf.gz', 'fn.vcf.gz'],
+                       'happy': ['happy-output.vcf.gz']}
 
 tool_dockers = {'aardvark': vcfcomp.default_aardvark_docker,
                 'vcfeval': vcfcomp.default_vcfeval_docker,
@@ -392,6 +400,19 @@ def compare_all_samples(job, options, manifest_rows, split_by_callset, ref_id, r
                                        callset, len(missing), len(all_samples),
                                        ', '.join(missing[:10]) + (' ...' if len(missing) > 10 else '')))
 
+    # --exportVcfs auto: keep the annotated VCFs of truth sets with a single sample in this run
+    # (GIAB), where they cost little and are the first thing to look at when a callset loses.
+    # getattr: a --restart of a job store from before the option has options pickled without it
+    export_mode = getattr(options, 'exportVcfs', 'auto')
+    truthset_samples = defaultdict(set)
+    for row in truth_rows:
+        truthset_samples[row['truthset']].add(row['sample'])
+    vcf_truthsets = set(t for t in truthsets if export_mode == 'all' or
+                        (export_mode == 'auto' and len(truthset_samples[t]) == 1))
+    if vcf_truthsets and options.outDir and not options.exportAll:
+        RealtimeLogger.info('Exporting the annotated VCFs for truth set(s) {}'.format(
+            ', '.join(sorted(vcf_truthsets))))
+
     results = []
     # one fetch per (sample, truthset) -- shared by every callset, since they are all scored
     # against the same truth
@@ -407,6 +428,7 @@ def compare_all_samples(job, options, manifest_rows, split_by_callset, ref_id, r
                                                          sample, tool,
                                                          split_by_callset[callset][sample], fetch_job.rv(),
                                                          ref_id, ref_fai_id, sdf_id,
+                                                         truthset in vcf_truthsets,
                                                          cores=options.threads,
                                                          memory=clamp_memory(options.compareMemory),
                                                          disk=int(ref_id.size * 5) + options.compareDisk)
@@ -476,7 +498,7 @@ def infer_haploid_sex(vcf_path):
 
 
 def compare_sample(job, options, callset, truthset, sample, tool, query_vcf_id, truth_ids,
-                   ref_id, ref_fai_id, sdf_id):
+                   ref_id, ref_fai_id, sdf_id, export_vcfs=False):
     """ the actual comparison for one sample with one tool.
 
     Never propagates a failure.  make_report is a follow-on of the whole fan-out, so a single job
@@ -486,7 +508,7 @@ def compare_sample(job, options, callset, truthset, sample, tool, query_vcf_id, 
     """
     try:
         return run_comparison(job, options, callset, truthset, sample, tool, query_vcf_id,
-                              truth_ids, ref_id, ref_fai_id, sdf_id)
+                              truth_ids, ref_id, ref_fai_id, sdf_id, export_vcfs)
     except Exception as e:
         RealtimeLogger.error('{}/{}/{}/{} FAILED: {}\n{}'.format(callset, truthset, sample, tool, e,
                                                                  traceback.format_exc()))
@@ -495,7 +517,7 @@ def compare_sample(job, options, callset, truthset, sample, tool, query_vcf_id, 
 
 
 def run_comparison(job, options, callset, truthset, sample, tool, query_vcf_id, truth_ids,
-                   ref_id, ref_fai_id, sdf_id):
+                   ref_id, ref_fai_id, sdf_id, export_vcfs=False):
     work_dir = job.fileStore.getLocalTempDir()
     out_dir = os.path.join(work_dir, tool)
     os.makedirs(out_dir)
@@ -552,7 +574,8 @@ def run_comparison(job, options, callset, truthset, sample, tool, query_vcf_id, 
         vcfcomp.aardvark(truth_prepped, query_prepped, ref_path, regions_bed, sample, out_dir,
                          threads=int(job.cores), options=options.toolOptions[tool],
                          docker_image=options.docker[tool])
-        chrom_table = vcfcomp.aardvark_chromsplit(out_dir)
+        chrom_table = vcfcomp.aardvark_chromsplit(out_dir,
+                                                  errors_path=os.path.join(out_dir, 'errors.tsv.gz'))
     elif tool == 'vcfeval':
         vcfcomp.vcfeval(truth_prepped, query_prepped, ref_path, regions_bed, sample, out_dir,
                         threads=int(job.cores), options=options.toolOptions[tool],
@@ -576,7 +599,7 @@ def run_comparison(job, options, callset, truthset, sample, tool, query_vcf_id, 
                                'but produced nothing to report'.format(callset, truthset, sample, tool))
     chrom_rows = report.chromsplit_to_long(chrom_table, callset, truthset, sample, tool)
 
-    export_sample_outputs(job, options, callset, truthset, sample, tool, out_dir)
+    export_sample_outputs(job, options, callset, truthset, sample, tool, out_dir, export_vcfs)
 
     return {'rows': rows, 'chrom_rows': chrom_rows}
 
@@ -645,21 +668,17 @@ def resolve_regions(job, options, sample, truth_ids, work_dir):
     return regions
 
 
-def export_sample_outputs(job, options, callset, truthset, sample, tool, out_dir):
-    """ export the per-sample summaries (and, with --exportAll, the whole output directory) """
+def export_sample_outputs(job, options, callset, truthset, sample, tool, out_dir, export_vcfs=False):
+    """ export the per-sample summaries, with export_vcfs the tool's annotated VCFs too, and with
+    --exportAll the whole output directory """
     if not options.outDir:
         return
     dest_dir = os.path.join(options.outDir, callset, truthset, sample, tool)
     if not options.outDir.startswith('s3://') and not os.path.isdir(dest_dir):
         os.makedirs(dest_dir, exist_ok=True)
 
-    for pattern in summary_globs.get(tool, []):
-        for path in sorted(glob.glob(os.path.join(out_dir, pattern))):
-            file_id = job.fileStore.writeGlobalFile(path)
-            job.fileStore.exportFile(file_id, makeURL(os.path.join(dest_dir, os.path.basename(path))))
-            # the job store copy exists only to hand the file to exportFile
-            job.fileStore.deleteGlobalFile(file_id)
-
+    # the tarball first: deleteGlobalFile below also deletes the local file that writeGlobalFile
+    # registered, so tarring afterwards would leave out the summaries and errors.tsv.gz
     if options.exportAll:
         # the reference is hard-linked into out_dir so the container can see it, which costs no
         # disk but which tar reads in full regardless of link count -- on a whole human genome
@@ -677,6 +696,17 @@ def export_sample_outputs(job, options, callset, truthset, sample, tool, out_dir
         file_id = job.fileStore.writeGlobalFile(tar_path)
         job.fileStore.exportFile(file_id, makeURL(os.path.join(dest_dir, os.path.basename(tar_path))))
         job.fileStore.deleteGlobalFile(file_id)
+
+    patterns = list(summary_globs.get(tool, []))
+    if export_vcfs and not options.exportAll:
+        patterns += [p + ext for p in annotated_vcf_globs.get(tool, []) for ext in ['', '.tbi']]
+    for pattern in patterns:
+        for path in sorted(glob.glob(os.path.join(out_dir, pattern))):
+            file_id = job.fileStore.writeGlobalFile(path)
+            job.fileStore.exportFile(file_id, makeURL(os.path.join(dest_dir, os.path.basename(path))))
+            # the job store copy exists only to hand the file to exportFile
+            job.fileStore.deleteGlobalFile(file_id)
+
 
 
 def make_report(job, options, results):
@@ -908,6 +938,13 @@ def main():
     parser.add_argument('--exportAll', action='store_true',
                         help='export each comparison\'s full output directory as a tarball, not just '
                         'its summary files')
+    parser.add_argument('--exportVcfs', choices=['auto', 'all', 'none'], default='auto',
+                        help='export each comparison\'s annotated (TP/FP/FN) VCFs and their indexes. '
+                        'auto does it for truth sets with a single sample in this run, such as '
+                        'GIAB\'s (~165 MB per callset for HG002); all for every truth set (~85 MB per '
+                        'dipcall sample, ~19 GB per 231-sample callset); none never. aardvark\'s '
+                        'FP/FN record table, errors.tsv.gz, is exported for every comparison '
+                        'regardless [auto]')
     parser.add_argument('--aardvarkOptions', default=vcfcomp.default_aardvark_options,
                         help='options for aardvark (surround in quotes)')
     parser.add_argument('--vcfevalOptions', default=vcfcomp.default_vcfeval_options,

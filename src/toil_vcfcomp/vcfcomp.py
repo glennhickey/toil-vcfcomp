@@ -639,8 +639,46 @@ def aardvark(truth_vcf,
     subprocess.check_call('mv {}/* {}'.format(ve_dir, output_dir), shell=True)
     shutil.rmtree(ve_dir)
     
-def aardvark_chromsplit(aardvark_outdir):
-    """ breakdown the aardvark vcfs into a per-chromosome table"""
+# the FP/FN records of one comparison, one per line.  1-2 MB per dipcall sample, against ~85 MB
+# for the annotated VCFs (and more for --exportAll), so it is kept for every comparison: it is
+# what locates an error difference between two callsets, which the per-contig counts cannot.
+# class is the SNP/INDEL/SV-SNP/SV-INDEL of the per-contig table and size_class its SNV/SMALL/SV50;
+# end is the last REF base; ea/oa are aardvark's expected and observed allele counts; alleles over
+# ERROR_TABLE_MAX_ALLELE bp are written as their length, <123bp>.  ri, aardvark's comparison-region
+# id (records with the same ri were compared together), is last because aardvark numbers regions
+# per run: cut it off before diffing two callsets' tables
+ERROR_TABLE_COLUMNS = ['chrom', 'pos', 'end', 'side', 'class', 'size_class', 'ref_len', 'alt_len',
+                       'gt', 'ea', 'oa', 'ref', 'alt', 'ri']
+ERROR_TABLE_MAX_ALLELE = 50
+
+def short_allele(allele):
+    return allele if len(allele) <= ERROR_TABLE_MAX_ALLELE else '<{}bp>'.format(len(allele))
+
+def format_gt(sample):
+    gt = sample.get('GT')
+    if gt is None:
+        return '.'
+    return ('|' if sample.phased else '/').join('.' if a is None else str(a) for a in gt)
+
+def format_field(sample, key):
+    try:
+        val = sample[key]
+    except KeyError:
+        return '.'
+    return '.' if val is None else str(val)
+
+def write_error_table(error_rows, contig_order, errors_path):
+    """ write the rows sorted by contig (in VCF header order), position and side, bgzipped """
+    rank = dict((c, i) for i, c in enumerate(contig_order))
+    error_rows.sort(key=lambda r: (rank.get(r[0], len(rank)), r[0], r[1], r[3]))
+    with pysam.BGZFile(errors_path, 'wb') as out_file:
+        out_file.write(('#' + '\t'.join(ERROR_TABLE_COLUMNS) + '\n').encode())
+        for row in error_rows:
+            out_file.write(('\t'.join(str(x) for x in row) + '\n').encode())
+
+def aardvark_chromsplit(aardvark_outdir, errors_path=None):
+    """ breakdown the aardvark vcfs into a per-chromosome table.  with errors_path, also write
+    every FP and FN record there (see write_error_table) """
 
     snp_fp = defaultdict(int)
     snp_fn = defaultdict(int)
@@ -673,8 +711,18 @@ def aardvark_chromsplit(aardvark_outdir):
         size_counts[(cls, kind, var.contig)] += 1
         size_counts[(cls, kind, '_total_')] += 1
 
+    error_rows = []
+    def error_row(var, sample, side):
+        cls = ('SV-' if is_sv(var) else '') + ('SNP' if is_snp(var) else 'INDEL')
+        return [var.contig, var.pos, var.stop, side, cls, size_class(var), len(var.ref),
+                max(len(a) for a in var.alts) if var.alts else 0,
+                format_gt(sample), format_field(sample, 'EA'), format_field(sample, 'OA'),
+                short_allele(var.ref), ','.join(short_allele(a) for a in var.alts) if var.alts else '.',
+                format_field(sample, 'RI')]
+
     fp_vcf = os.path.join(aardvark_outdir, 'query.vcf.gz')
     fp_vcf_file = pysam.VariantFile(fp_vcf, 'r')
+    contig_order = list(fp_vcf_file.header.contigs)
     contigs = set(['_total_'])
     for var in fp_vcf_file.fetch():
         assert len(var.samples.values()) == 1
@@ -685,6 +733,8 @@ def aardvark_chromsplit(aardvark_outdir):
         if sample['BD'] == 'FP':            
             count_size(var, 'FP')
             contigs.add(var.contig)
+            if errors_path:
+                error_rows.append(error_row(var, sample, 'FP'))
             if is_sv(var):
                 snp_dict = sv_snp_fp
                 indel_dict = sv_indel_fp
@@ -712,6 +762,8 @@ def aardvark_chromsplit(aardvark_outdir):
         if sample['BD'] == 'FN':            
             count_size(var, 'FN')
             contigs.add(var.contig)
+            if errors_path:
+                error_rows.append(error_row(var, sample, 'FN'))
             if is_sv(var):
                 snp_dict = sv_snp_fn
                 indel_dict = sv_indel_fn
@@ -724,7 +776,11 @@ def aardvark_chromsplit(aardvark_outdir):
             else:
                 indel_dict[var.contig] += 1
                 indel_dict['_total_'] += 1
+    contig_order += [c for c in fn_vcf_file.header.contigs if c not in contig_order]
     fn_vcf_file.close()
+
+    if errors_path:
+        write_error_table(error_rows, contig_order, errors_path)
 
     output_table = [['type'] + sorted(contigs)]
     output_table += [['ERRORS'], ['SNP-FP'], ['SNP-FN'], ['INDEL-FP'], ['INDEL-FN'],
